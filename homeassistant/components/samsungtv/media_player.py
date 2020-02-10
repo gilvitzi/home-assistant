@@ -34,10 +34,13 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.script import Script
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_MANUFACTURER, CONF_MODEL, CONF_ON_ACTION, DOMAIN, LOGGER
+from .const import CONF_MANUFACTURER, CONF_MODEL, CONF_TOKEN, CONF_ON_ACTION, DOMAIN, LOGGER
 
 KEY_PRESS_TIMEOUT = 1.2
-SOURCES = {"TV": "KEY_TV", "HDMI": "KEY_HDMI"}
+DEFAULT_SOURCES = {
+    "TV": "KEY_TV", 
+    "HDMI": "KEY_HDMI"
+}
 
 SUPPORT_SAMSUNGTV = (
     SUPPORT_PAUSE
@@ -91,6 +94,9 @@ class SamsungTVDevice(MediaPlayerDevice):
         self._playing = True
         self._state = None
         self._remote = None
+        self._source_list = {}
+        self._selected_source = None
+
         # Mark the end of a shutdown command (need to wait 15 seconds before
         # sending the next command to avoid turning the TV back ON).
         self._end_of_power_off = None
@@ -103,6 +109,7 @@ class SamsungTVDevice(MediaPlayerDevice):
             "port": config_entry.data.get(CONF_PORT),
             "host": config_entry.data[CONF_HOST],
             "timeout": 1,
+            "token": config_entry.data.get(CONF_TOKEN)
         }
 
     def update(self):
@@ -121,7 +128,7 @@ class SamsungTVDevice(MediaPlayerDevice):
                     self._state = STATE_ON
             except (
                 samsung_exceptions.UnhandledResponse,
-                samsung_exceptions.AccessDenied,
+                samsung_exceptions.Unauthorized,
             ):
                 # We got a response so it's working.
                 self._state = STATE_ON
@@ -135,9 +142,10 @@ class SamsungTVDevice(MediaPlayerDevice):
             # We need to create a new instance to reconnect.
             try:
                 self._remote = SamsungRemote(self._config.copy())
+                self.update_sources()
             # This is only happening when the auth was switched to DENY
             # A removed auth will lead to socket timeout because waiting for auth popup is just an open socket
-            except samsung_exceptions.AccessDenied:
+            except samsung_exceptions.Unauthorized:
                 self.hass.async_create_task(
                     self.hass.config_entries.flow.async_init(
                         DOMAIN,
@@ -159,7 +167,7 @@ class SamsungTVDevice(MediaPlayerDevice):
             retry_count = 1
             for _ in range(retry_count + 1):
                 try:
-                    self.get_remote().control(key)
+                    self.get_remote().click_key(key)
                     break
                 except (
                     samsung_exceptions.ConnectionClosed,
@@ -169,7 +177,7 @@ class SamsungTVDevice(MediaPlayerDevice):
                     # BrokenPipe can occur when the commands is sent to fast
                     # WebSocketException can occur when timed out
                     self._remote = None
-        except (samsung_exceptions.UnhandledResponse, samsung_exceptions.AccessDenied):
+        except (samsung_exceptions.UnhandledResponse, samsung_exceptions.Unauthorized):
             # We got a response so it's on.
             LOGGER.debug("Failed sending command %s", key, exc_info=True)
         except OSError:
@@ -181,6 +189,18 @@ class SamsungTVDevice(MediaPlayerDevice):
             self._end_of_power_off is not None
             and self._end_of_power_off > dt_util.utcnow()
         )
+
+    def update_sources(self):
+        """Update list of sources from current source, apps, inputs and configured list."""
+        self._source_list = {}
+        app_list = self.get_remote().get_app_list()
+
+        if not app_list:
+            self._source_list = DEFAULT_SOURCES
+            return 
+        
+        for app in app_list:
+            self._source_list[app["name"]] = app
 
     @property
     def unique_id(self) -> str:
@@ -215,7 +235,7 @@ class SamsungTVDevice(MediaPlayerDevice):
     @property
     def source_list(self):
         """List of available input sources."""
-        return list(SOURCES)
+        return list(self._source_list.keys()) + list(DEFAULT_SOURCES.keys())
 
     @property
     def supported_features(self):
@@ -229,11 +249,20 @@ class SamsungTVDevice(MediaPlayerDevice):
         """Set the device class to TV."""
         return DEVICE_CLASS_TV
 
+    @property
+    def source(self):
+        """Name of the current input source."""
+        return self._get_source()
+
     def turn_off(self):
         """Turn off media player."""
         self._end_of_power_off = dt_util.utcnow() + timedelta(seconds=15)
 
-        if self._config["method"] == "websocket":
+        if self._config["method"] == "websocket" or self._config["method"] == "websocket-secure":
+            # for Samsung 'The Frame':
+            # a single POWER key will go into "Art Mode"
+            # to completely turn off the TV we will need to hold the POWER for 3 seconds >>> remote.hold_key(Key.KEY_POWER, duration=3)
+            # And then we should probably add "Art Mode" as a special input source and handle it's selection
             self.send_key("KEY_POWER")
         else:
             self.send_key("KEY_POWEROFF")
@@ -306,8 +335,17 @@ class SamsungTVDevice(MediaPlayerDevice):
 
     def select_source(self, source):
         """Select input source."""
-        if source not in SOURCES:
+        if source in DEFAULT_SOURCES:
+            # Special Sources that has a specific remote key (Live TV / HDMI etc..)
+            self.send_key(DEFAULT_SOURCES[source])
+        elif source in self._source_list:
+            app = self._source_list[source]
+            self.get_remote().open_app(app['appId'])
+        else:
             LOGGER.error("Unsupported source")
             return
 
-        self.send_key(SOURCES[source])
+        self._selected_source = source
+
+    def _get_source(self):
+        return self._selected_source

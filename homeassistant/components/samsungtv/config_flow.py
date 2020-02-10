@@ -3,7 +3,7 @@ import socket
 from urllib.parse import urlparse
 
 from samsungctl import Remote
-from samsungctl.exceptions import AccessDenied, UnhandledResponse
+from samsungctl.exceptions import Unauthorized, UnhandledResponse
 import voluptuous as vol
 from websocket import WebSocketException
 
@@ -21,10 +21,11 @@ from homeassistant.const import (
     CONF_METHOD,
     CONF_NAME,
     CONF_PORT,
+    CONF_TOKEN
 )
 
 # pylint:disable=unused-import
-from .const import CONF_MANUFACTURER, CONF_MODEL, DOMAIN, LOGGER
+from .const import CONF_MANUFACTURER, CONF_MODEL, CONF_TOKEN, DOMAIN, LOGGER
 
 DATA_SCHEMA = vol.Schema({vol.Required(CONF_HOST): str, vol.Required(CONF_NAME): str})
 
@@ -34,6 +35,7 @@ RESULT_NOT_SUCCESSFUL = "not_successful"
 RESULT_NOT_SUPPORTED = "not_supported"
 
 SUPPORTED_METHODS = (
+    {"method": "websocket-secure", "timeout": 31},
     {"method": "websocket", "timeout": 1},
     # We need this high timeout because waiting for auth popup is just an open socket
     {"method": "legacy", "timeout": 31},
@@ -65,6 +67,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._port = None
         self._title = None
         self._id = None
+        self._token = None
 
     def _get_entry(self):
         return self.async_create_entry(
@@ -78,6 +81,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_MODEL: self._model,
                 CONF_NAME: self._name,
                 CONF_PORT: self._port,
+                CONF_TOKEN: self._token,
             },
         )
 
@@ -94,12 +98,16 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             config.update(cfg)
             try:
                 LOGGER.debug("Try config: %s", config)
-                with Remote(config.copy()):
+                with Remote(config.copy()) as remote:
                     LOGGER.debug("Working config: %s", config)
                     self._method = cfg["method"]
+                    if 'token' in remote.config:
+                        LOGGER.debug("saved token in config: %s", config)
+                        self._token = remote.config['token']
                     return RESULT_SUCCESS
-            except AccessDenied:
-                LOGGER.debug("Working but denied config: %s", config)
+            except Unauthorized:
+                self._token = None
+                LOGGER.debug("Working but unauthorized. check popup on TV and click Accept. config: %s", config)
                 return RESULT_AUTH_MISSING
             except (UnhandledResponse, WebSocketException):
                 LOGGER.debug("Working but unsupported config: %s", config)
